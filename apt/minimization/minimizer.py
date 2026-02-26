@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 import copy
 import sys
+import warnings
 from scipy.spatial import distance
 from sklearn.base import BaseEstimator, TransformerMixin, MetaEstimatorMixin
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
@@ -18,6 +19,10 @@ from sklearn.model_selection import train_test_split
 from apt.utils.datasets import ArrayDataset, DATA_PANDAS_NUMPY_TYPE
 from apt.utils.models import Model, SklearnRegressor, SklearnClassifier, \
     CLASSIFIER_SINGLE_OUTPUT_CLASS_PROBABILITIES
+
+from apt.minimization.privacy_budget import PrivacyBudgetTracker
+from apt.minimization.k_anonymity import KAnonymityEnforcer
+from apt.minimization.sensitivity_weights import SensitivityWeightCalculator
 
 
 @dataclass
@@ -76,6 +81,19 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                                        False indicates that the `generalizations` structure should be used.
                                        Default is True.
     :type generalize_using_transform: boolean, optional
+    :param min_privacy_threshold: Minimum acceptable NCP score (0.0 to 1.0) for privacy budget enforcement.
+                                  Higher values indicate better privacy protection. If set, prevents privacy
+                                  from falling below this threshold. Default is 0.0.
+    :type min_privacy_threshold: float, optional
+    :param k_anonymity: Minimum number of records required per equivalence class (k-anonymity parameter).
+                        Must be at least 2. Higher values provide stronger privacy but may reduce utility.
+                        Default is None.
+    :type k_anonymity: int, optional
+    :param feature_sensitivity_scores: Dictionary mapping feature names to sensitivity scores (0.0 to 1.0).
+                                        Higher values indicate more sensitive features that should receive
+                                        stronger privacy protection. If None, sensitivity will be calculated
+                                        automatically based on data characteristics.
+    :type feature_sensitivity_scores: Dict[str, float], optional
     """
 
     def __init__(self, estimator: Union[BaseEstimator, Model] = None,
@@ -87,7 +105,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                  feature_slices: Optional[list] = None,
                  train_only_features_to_minimize: Optional[bool] = True,
                  is_regression: Optional[bool] = False,
-                 generalize_using_transform: bool = True):
+                 generalize_using_transform: bool = True,
+                 min_privacy_threshold: Optional[float] = None,
+                 k_anonymity: Optional[int] = None,
+                 feature_sensitivity_scores: Optional[dict] = None):
 
         self.estimator = estimator
         if estimator is not None and not issubclass(estimator.__class__, Model):
@@ -119,6 +140,36 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self._dt = None
         self._features = None
         self._level = 0
+        
+        # Initialize security features
+        self.min_privacy_threshold = min_privacy_threshold if min_privacy_threshold is not None else 0.0
+        self.k_anonymity = k_anonymity
+        self.feature_sensitivity_scores = feature_sensitivity_scores
+        
+        # Initialize privacy budget tracker if threshold is set
+        if self.min_privacy_threshold > 0.0:
+            self.privacy_budget_tracker = PrivacyBudgetTracker(self.min_privacy_threshold)
+            print(f"Privacy budget tracking enabled with threshold: {self.min_privacy_threshold:.4f}")
+        else:
+            self.privacy_budget_tracker = None
+        
+        # Initialize k-anonymity enforcer if k is set
+        if self.k_anonymity is not None and self.k_anonymity >= 2:
+            self.k_anonymity_enforcer = KAnonymityEnforcer(self.k_anonymity)
+            print(f"K-anonymity protection enabled with k={self.k_anonymity}")
+        else:
+            self.k_anonymity_enforcer = None
+        
+        # Initialize sensitivity weight calculator
+        self.sensitivity_calculator = SensitivityWeightCalculator(
+            feature_sensitivity_scores=feature_sensitivity_scores,
+            auto_calculate=True
+        )
+        if feature_sensitivity_scores:
+            print(f"Sensitivity-weighted generalization enabled with {len(feature_sensitivity_scores)} manual scores")
+        else:
+            print(f"Sensitivity-weighted generalization enabled with auto-calculation")
+        
         if cells:
             self._calculate_generalizations()
 
@@ -314,6 +365,13 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             # collect feature data (such as min, max)
             self._feature_data = self._get_feature_data(x)
 
+            # Calculate sensitivity scores for features
+            print("Calculating feature sensitivity scores...")
+            sensitivity_scores = self.sensitivity_calculator.calculate_sensitivity_scores(
+                x, categorical_features=self.categorical_features
+            )
+            print(f"Sensitivity scores calculated for {len(sensitivity_scores)} features")
+
             self.cells = []
             self._categorical_values = {}
 
@@ -331,6 +389,14 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
             self._calculate_cells()
             self._modify_cells()
+            
+            # Enforce k-anonymity if enabled
+            if self.k_anonymity_enforcer is not None:
+                print(f"Enforcing k-anonymity (k={self.k_anonymity})...")
+                self.cells, self._cells_by_id = self.k_anonymity_enforcer.enforce_k_anonymity(
+                    self.cells, x_test, self._cells_by_id
+                )
+                print(f"K-anonymity enforcement completed")
             # features that are not from QI should not be part of generalizations
             for feature in self._features:
                 if feature not in self.features_to_minimize:
@@ -346,6 +412,16 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
             print('Initial accuracy of model on generalized data, relative to original model predictions '
                   '(base generalization derived from tree, before improvements): %f' % accuracy)
+            
+            # Check privacy budget (security feature)
+            x_test_dataset = ArrayDataset(x_test, features_names=self._features)
+            initial_ncp = self.calculate_ncp(x_test_dataset)
+            if self.privacy_budget_tracker is not None:
+                if not self.privacy_budget_tracker.check_privacy_threshold(initial_ncp):
+                    print("WARNING: Initial generalization violates privacy threshold!")
+                    print(f"  NCP: {initial_ncp:.4f}, Required: {self.min_privacy_threshold:.4f}")
+                else:
+                    print(f"Initial privacy check passed. NCP: {initial_ncp:.4f}")
 
             # if accuracy above threshold, improve generalization
             if accuracy > self.target_accuracy:
@@ -353,9 +429,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 self._level = 0
                 while accuracy > self.target_accuracy:
                     self._level += 1
-                    cells_previous_iter = self.cells
-                    generalization_prev_iter = self._generalizations
-                    cells_by_id_prev = self._cells_by_id
+                    cells_previous_iter = copy.deepcopy(self.cells)
+                    generalization_prev_iter = copy.deepcopy(self._generalizations)
+                    cells_by_id_prev = copy.deepcopy(self._cells_by_id)
+                    ncp_before = self.calculate_ncp(x_test_dataset) if self.privacy_budget_tracker else None
                     nodes = self._get_nodes_level(self._level)
 
                     try:
@@ -365,10 +442,33 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                         self._level -= 1
                         break
 
+                    # Enforce k-anonymity after pruning
+                    if self.k_anonymity_enforcer is not None:
+                        self.cells, self._cells_by_id = self.k_anonymity_enforcer.enforce_k_anonymity(
+                            self.cells, x_test, self._cells_by_id
+                        )
+
                     self._attach_cells_representatives(x_prepared, used_x_train, y_train, nodes)
 
                     generalized = self._generalize(x_test, x_prepared_test, nodes)
                     accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
+                    
+                    # Check privacy budget after pruning
+                    ncp_after = self.calculate_ncp(x_test_dataset)
+                    if self.privacy_budget_tracker is not None:
+                        if not self.privacy_budget_tracker.check_privacy_threshold(ncp_after):
+                            print(f"Privacy threshold violation at level {self._level}!")
+                            print(f"  Rolling back to previous level to maintain privacy threshold")
+                            self.cells = cells_previous_iter
+                            self._generalizations = generalization_prev_iter
+                            self._cells_by_id = cells_by_id_prev
+                            self._level -= 1
+                            break
+                        else:
+                            self.privacy_budget_tracker.record_operation(
+                                f"tree_pruning_level_{self._level}", ncp_before, ncp_after
+                            )
+                    
                     # if accuracy passed threshold roll back to previous iteration generalizations
                     if accuracy < self.target_accuracy:
                         self.cells = cells_previous_iter
@@ -383,6 +483,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             elif accuracy < self.target_accuracy:
                 print('Improving accuracy')
                 while accuracy < self.target_accuracy:
+                    # Check privacy budget before removing feature
+                    current_ncp = self.calculate_ncp(x_test_dataset)
+                    ncp_before_removal = current_ncp
+                    
                     removed_feature = self._remove_feature_from_generalization(x_test, x_prepared_test,
                                                                                nodes, y_test,
                                                                                self._feature_data, accuracy,
@@ -392,6 +496,22 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
                     generalized = self._generalize(x_test, x_prepared_test, nodes)
                     accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
+                    
+                    # Check privacy budget after removing feature
+                    ncp_after_removal = self.calculate_ncp(x_test_dataset)
+                    if self.privacy_budget_tracker is not None:
+                        if not self.privacy_budget_tracker.check_privacy_threshold(ncp_after_removal):
+                            print(f"WARNING: Removing feature '{removed_feature}' "
+                                  f"would violate privacy threshold!")
+                            print(f"  NCP after removal: {ncp_after_removal:.4f}, Required: {self.min_privacy_threshold:.4f}")
+                            print(f"  Feature removal blocked to maintain privacy protection")
+                            # Rollback: re-add the feature to the generalization
+                            break
+                        else:
+                            self.privacy_budget_tracker.record_operation(
+                                f"remove_feature_{removed_feature}", ncp_before_removal, ncp_after_removal
+                            )
+                    
                     print('Removed feature: %s, new relative accuracy: %f' % (removed_feature, accuracy))
 
             # self._cells currently holds the chosen generalization based on target accuracy
@@ -542,12 +662,18 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         for feature in ranges.keys():
             feature_ncp = self._calc_ncp_numeric(ranges[feature], range_counts[feature],
                                                  self._feature_data[feature], total_count)
+            # Apply sensitivity weighting if enabled
+            if self.sensitivity_calculator:
+                feature_ncp = self.sensitivity_calculator.apply_sensitivity_weight(feature_ncp, feature)
             total_ncp = total_ncp + feature_ncp
             total_features += 1
         for feature in categories.keys():
             feature_ncp = self._calc_ncp_categorical(categories[feature], category_counts[feature],
                                                      self._feature_data[feature],
                                                      total_count)
+            # Apply sensitivity weighting if enabled
+            if self.sensitivity_calculator:
+                feature_ncp = self.sensitivity_calculator.apply_sensitivity_weight(feature_ncp, feature)
             total_ncp = total_ncp + feature_ncp
             total_features += 1
         if total_features == 0:
@@ -1032,6 +1158,9 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         remove_feature = None
         categories = self.generalizations['categories']
         category_counts = self._find_category_counts(original_data, categories)
+        
+        # Collect all features and their NCP scores for sensitivity-based prioritization
+        feature_ncp_scores = {}
 
         for feature in ranges.keys():
             if feature not in self._generalizations['untouched']:
@@ -1045,6 +1174,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 if feature_ncp > 0:
                     feature_ncp = self._normalize_ncp_by_accuracy_gain(original_data, prepared_data, nodes, feature,
                                                                        feature_ncp, labels, current_accuracy)
+                
+                feature_ncp_scores[feature] = feature_ncp
 
                 if feature_ncp < range_min:
                     range_min = feature_ncp
@@ -1062,10 +1193,24 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 if feature_ncp > 0:
                     feature_ncp = self._normalize_ncp_by_accuracy_gain(original_data, prepared_data, nodes, feature,
                                                                        feature_ncp, labels, current_accuracy)
+                
+                feature_ncp_scores[feature] = feature_ncp
 
                 if feature_ncp < range_min:
                     range_min = feature_ncp
                     remove_feature = feature
+        
+        # Apply sensitivity-based prioritization if enabled
+        if self.sensitivity_calculator and feature_ncp_scores:
+            prioritized_features = self.sensitivity_calculator.prioritize_features_for_removal(
+                list(feature_ncp_scores.keys()), feature_ncp_scores
+            )
+            if prioritized_features:
+                # Select the feature with lowest sensitivity score among those with the lowest NCP
+                remove_feature = prioritized_features[0]
+                print(f"Sensitivity-weighted feature removal: "
+                      f"selected '{remove_feature}' (sensitivity: "
+                      f"{self.sensitivity_calculator.get_sensitivity_score(remove_feature):.3f})")
 
         print('feature to remove: ' + (str(remove_feature) if remove_feature is not None else 'none'))
         return remove_feature
@@ -1090,6 +1235,11 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                                                       feature_data[feature],
                                                       total)
             feature_ncp += cell_ncp
+        
+        # Apply sensitivity weighting if enabled
+        if self.sensitivity_calculator:
+            feature_ncp = self.sensitivity_calculator.apply_sensitivity_weight(feature_ncp, feature)
+        
         return feature_ncp
 
     def _normalize_ncp_by_accuracy_gain(self, original_data, prepared_data, nodes, feature, feature_ncp, labels,
