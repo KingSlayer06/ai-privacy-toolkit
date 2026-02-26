@@ -43,8 +43,8 @@ def main():
     
     gen = GeneralizeToRepresentative(
         estimator=model,
-        target_accuracy=0.90,
-        min_privacy_threshold=0.5,      # Feature 1: Privacy budget enforcement
+        target_accuracy=0.95,
+        min_privacy_threshold=0.15,      # Feature 1: Privacy budget enforcement
         k_anonymity=7,                    # Feature 2: K-anonymity protection
         feature_sensitivity_scores={      # Feature 3: Sensitivity weighting
             'age': 0.9,
