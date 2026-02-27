@@ -41,6 +41,7 @@ def main():
     print("  - Sensitivity weighting: age = 0.9 and income = 0.85")
     print()
     
+    # Apply data minimization with security features
     gen = GeneralizeToRepresentative(
         estimator=model,
         target_accuracy=0.95,
