@@ -247,7 +247,7 @@ if gen.k_anonymity_enforcer:
 ### Prerequisites
 
 ```bash
-pip install numpy pandas scikit-learn scipy torch
+pip install -r requirements.txt
 ```
 
 ### Downloading datasets
