@@ -4,6 +4,8 @@
 
 The repository builds upon the original Goldsteen et al. (2022), an implementation of data minimization. This version includes three key security enhancements to protect user's privacy, and to provide additional GDPR compliant privacy protections. The security enhancements are designed to fill gaps within the original Goldsteen et al. (2022) implementation including: providing formal privacy assurances, mitigating the threat of homogeneous attacks, and sensitivity aware generalizations.
 
+The diff between this fork and the original IBM `ai-privacy-toolkit` repository is available in `changes.diff` at the repository root.
+
 ## Original Paper
 
 **Citation:** Goldsteen, A., Ezov, G., Shmelkin, R. et al. Data minimization for GDPR compliance in machine learning models. AI Ethics (2021). https://doi.org/10.1007/s43681-021-00095-8
